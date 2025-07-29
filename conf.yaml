@@ -1,0 +1,27 @@
+# Copyright (C) 2025 Mitsubishi Electric Research Laboratories (MERL)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+dataset:
+  path: ./DCASE2023_dataset/  # path to DCASE ASD dataset
+  edition: DCASE2023  # DCASE2020, DCASE2023 or DCASE2024
+  eval_metrics: simple  # official or simple
+
+model:
+  mode: openL3-raw  # direct-act, openL3-act, openL3-raw, BEATs-act or BEATs-raw
+  norm_param: 16  # none (default), int (for K) or float (for r)
+  subspace_dim: 32  # dimension of the learned AdaProj subspaces (int)
+  bias: false  # use bias terms (Boolean)
+  affine: false  # use (learnable) affine transformations for batch normalizations (Boolean)
+  trainable_centers: false  # use trainable centers for the AdaProj loss (Boolean)
+
+training:
+  n_ensemble: 10  # number of models for the ensemble/confidence intervals (int)
+  batch_size: 64  # batch size for training/inference (int)
+  num_epochs_direct-act: 5  # number of epochs for direct-act (int)
+  num_epochs_openL3-act: 500  # number of epochs for openL3-act (int)
+  num_epochs_BEATs-act: 500  # number of epochs for BEATs-act (int)
+
+embs:
+  openL3_input_dim: 512  # dimension of the openL3 embeddings, should match the model used (int)
+  BEATs_input_dim: 6144  # dimension of the BEATs embeddings, should match the model used (int)
