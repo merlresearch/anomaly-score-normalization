@@ -17,10 +17,10 @@ If you use any part of this code for your work, we kindly ask you to cite the fo
 ```
 and
 ```
-@unpublished{wilkinghoff2025density,
+@article{wilkinghoff2025local,
    author = {Wilkinghoff, Kevin and Yang, Haici and Ebbers, Janek and Germain, Fran{\c{c}}ois G. and Wichern, Gordon and {Le Roux}, Jonathan},
    title = {Local Density-Based Anomaly Score Normalization for Domain Generalization},
-   note = {Preprint},
+   journal = {IEEE/ACM Trans. Audio, Speech, Lang. Process.},
    year = {2025}
 }
 ```
@@ -33,13 +33,13 @@ The code has been tested using `python 3.8` on both Linux and Windows, using CUD
 Necessary dependencies can be installed using the included `requirements.txt`:
 
 ```bash
-pip install torch==2.4.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118  # for GPU
+pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cu118  # for GPU
 pip install -r requirements.txt
 ```
 ***
 
 ## Datasets
-Currently, [DCASE2020](https://dcase.community/challenge2020/task-unsupervised-detection-of-anomalous-sounds#download), [DCASE2023](https://dcase.community/challenge2023/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring#download), and [DCASE2024](https://dcase.community/challenge2024/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring#download) are supported.
+Currently, [DCASE2020](https://dcase.community/challenge2020/task-unsupervised-detection-of-anomalous-sounds#download), [DCASE2022](https://dcase.community/challenge2022/task-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring#download), [DCASE2023](https://dcase.community/challenge2023/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring#download), [DCASE2024](https://dcase.community/challenge2024/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring#download), and [DCASE2025](https://dcase.community/challenge2025/task-first-shot-unsupervised-anomalous-sound-detection-for-machine-condition-monitoring#download) are supported.
 Each dataset should be in a folder containing the `development set`, the `additional training dataset` and the `evaluation set` with the following structure:
 ```
       dataset_path
@@ -60,11 +60,13 @@ Each dataset should be in a folder containing the `development set`, the `additi
           |-- train
         |-- ...
 ```
-To evaluate the performance on the evaluation set for DCASE2023 and DCASE2024, the ground-truth labels contained in the evaluator repositories need to be provided, i.e., [DCASE2023 evaluator](https://github.com/nttcslab/dcase2023_task2_evaluator) or [DCASE2024 evaluator](https://github.com/nttcslab/dcase2024_task2_evaluator). The corresponding GitHub repositories should be placed in the project folder, e.g., by using the following commands:
+To evaluate the performance on the evaluation set for DCASE2022, DCASE2023, DCASE2024 and DCASE2025, the ground-truth labels contained in the evaluator repositories need to be provided, i.e., [DCASE2022 evaluator](https://github.com/Kota-Dohi/dcase2022_evaluator), [DCASE2023 evaluator](https://github.com/nttcslab/dcase2023_task2_evaluator), [DCASE2024 evaluator](https://github.com/nttcslab/dcase2024_task2_evaluator), or [DCASE2025 evaluator](https://github.com/nttcslab/dcase2025_task2_evaluator). The corresponding GitHub repositories should be placed in the project folder, e.g., by using the following commands:
 
 ```bash
+      git clone https://github.com/Kota-Dohi/dcase2022_evaluator.git
       git clone https://github.com/nttcslab/dcase2023_task2_evaluator.git
       git clone https://github.com/nttcslab/dcase2024_task2_evaluator.git
+      git clone https://github.com/nttcslab/dcase2025_task2_evaluator.git
  ```
 leading to a directory structure of:
 
@@ -72,9 +74,13 @@ leading to a directory structure of:
       project_root
       |-- beats
         |-- ...
+      |-- dcase2022_evaluator
+        |-- ...
       |-- dcase2023_task2_evaluator
         |-- ...
       |-- dcase2024_task2_evaluator
+        |-- ...
+      |-- dcase2025_task2_evaluator
         |-- ...
       |-- tests
         |-- ...
@@ -105,21 +111,37 @@ The optional argument `--conf-path` specifies the path to the `conf.yaml` file, 
 
 - `model`: The embedding model being used. Based on the notation used in the paper, the following options are provided:
   - `direct-act`: an embedding model based on spectral features trained from scratch with an auxiliary classification task
+  - `STFT-raw`: using the temporal mean of spectrograms without any additional training
   - `openL3-act`: an embedding model based on pre-trained openL3 embeddings trained with an auxiliary classification task
   - `openL3-raw`: an embedding model based on pre-trained openL3 embeddings without any additional training
   - `BEATs-act`: an embedding model based on pre-trained BEATs embeddings trained with an auxiliary classification task
   - `BEATs-raw`: an embedding model based on pre-trained BEATs embeddings without any additional training
+  - `EAT-raw`: an embedding model based on pre-trained EAT embeddings without any additional training
 
   - Note: Using BEATs embeddings requires a [pre-trained BEATs model](https://onedrive.live.com/?authkey=%21ACVDQ8YOHlNK%5Frw&id=6B83B49411CA81A7%2125969&cid=6B83B49411CA81A7&parId=root&parQt=sharedby&o=OneUp) in the main folder. A list of alternative BEATs models can be found here: https://github.com/Phuriches/GenRepASD/tree/main/beats
 
+- `norm_type`: The type of local density-based score normalization to be applied. The following options are available:
+   - `None`: no normalization
+   - `ratio`: the proposed normalization based on dividing by the local density estimate
+   - `difference`: the proposed normalization based on subtracting the local density estimate
+   - `LOF`: LOF-based normalization (requires setting a value for `K` via `norm_param`)
+
 - `norm_param` is the hyperparameter used for the optional normalization of the anomaly scores and can be one of the following:
-   - omit this parameter: No normalization is applied.
+   - `None`: No normalization is applied.
    - `K` (int): K-NN based normalization where `K` equals the provided value is applied. Example: `16`
    - `r` (float): GWRP-based normalization where `r` equals the provided value is applied. Example: `0.9`
 
+- `source_K_means`: Whether to apply k-means on the source domain to replace the original reference samples on the source domain. Can be either:
+   - `None`: all reference samples are used
+   - `K` (int): number of means for k-Means
+
+- `standardize` (Boolean): Whether domain-wise standardization based on the test set is applied to the scores.
+
+- `smote` (Boolean): Whether SMOTE is applied to generate additional reference samples.
+
 - `dataset_path` should be a path to a DCASE ASD dataset, e.g., `./DCASE2023_dataset/`.
 
-- `edition`: The edition of the DCASE ASD dataset to be used, e.g., `DCASE2020`, `DCASE2023` or `DCASE2024`.
+- `edition`: The edition of the DCASE ASD dataset to be used, i.e., `DCASE2020`, `DCASE2022`, `DCASE2023`, `DCASE2024`, or `DCASE2025`.
 
 - `eval_metrics`: The user can choose between `official` and `simple` evaluation metrics when computing the performance:
   - `official`: use the normal test samples of a particular domain and all anomalous test samples of the source and target domain when computing a domain-specific AUC score. This is the same evaluation metric as used in the DCASE challenge.

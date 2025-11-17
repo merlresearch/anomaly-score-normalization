@@ -19,15 +19,36 @@ from network import (
     mixup_data,
     shallow_classifier,
 )
-from utils import get_ASD_performance, get_mean_embs, get_scores
+from utils import (
+    get_ASD_performance,
+    get_mean_embs,
+    get_scores,
+    get_standardization_stats,
+)
 
 
 class base_emb_model(L.LightningModule):
-    def __init__(self, K: int = None, r: float = None):
+    def __init__(
+        self,
+        source_K: int = None,
+        K: int = None,
+        r: float = None,
+        norm_type: str = "ratio",
+        standardize: bool = False,
+        smote: bool = False,
+        smote_num_neighbors: int = 2,
+        print_results: bool = True,
+    ):
         super().__init__()
         self.use_mse = False
         self.K = K
         self.r = r
+        self.source_K = source_K
+        self.norm_type = norm_type
+        self.standardize = standardize
+        self.smote = smote
+        self.smote_num_neighbors = smote_num_neighbors
+        self.print_results = print_results
         self.save_hyperparameters()
 
         # tensors needed for evaluation
@@ -45,6 +66,10 @@ class base_emb_model(L.LightningModule):
         self.test_machine_ids = []
         self.test_source_labels = []
         self.test_anomaly_labels = []
+        self.dists_source_mean = []
+        self.dists_source_std = []
+        self.dists_target_mean = []
+        self.dists_target_std = []
 
     @abstractmethod
     def forward(self, x):
@@ -90,18 +115,22 @@ class base_emb_model(L.LightningModule):
     def predict_step(self, batch, batch_nb):
         x, y, machine_id, source = batch
         embs = self.get_normalized_embs_(x)
-        source_estimate = None  # source --> change between using ground truth or not, doesn't make a big difference
         scores = get_scores(
-            torch.cat(self.train_embs, dim=0),
-            torch.cat(self.train_machine_ids, dim=0),
-            torch.cat(self.train_source_labels, dim=0),
+            self.means,
+            self.mean_machine_ids,
+            self.mean_source_labels,
             embs,
             machine_id,
-            source_estimate,
             use_mse=self.use_mse,
             K=self.K,
             r=self.r,
-        )  # this is the old approach without k-means
+            norm_type=self.norm_type,
+            standardize=self.standardize,
+            dists_source_mean=self.dists_source_mean,
+            dists_source_std=self.dists_source_std,
+            dists_target_mean=self.dists_target_mean,
+            dists_target_std=self.dists_target_std,
+        )
         return scores, machine_id, source, y
 
     def on_validation_epoch_end(self):
@@ -111,8 +140,29 @@ class base_emb_model(L.LightningModule):
                 self.train_embs,
                 self.train_machine_ids,
                 self.train_source_labels,
-                k=self.subspace_dim,
+                k=self.source_K,
+                smote=self.smote,
+                smote_num_neighbors=self.smote_num_neighbors,
+                use_mse=self.use_mse,
             )
+        )
+
+        # get standardization statistics
+        (
+            self.dists_source_mean,
+            self.dists_source_std,
+            self.dists_target_mean,
+            self.dists_target_std,
+        ) = get_standardization_stats(
+            self.means,
+            self.mean_machine_ids,
+            self.mean_source_labels,
+            self.val_embs,
+            self.val_machine_ids,
+            use_mse=self.use_mse,
+            K=self.K,
+            r=self.r,
+            norm_type=self.norm_type,
         )
 
         # compute performance
@@ -124,7 +174,16 @@ class base_emb_model(L.LightningModule):
             self.val_machine_ids,
             self.val_source_labels,
             self.val_anomaly_labels,
-            print_results=True,
+            print_results=self.print_results,
+            use_mse=self.use_mse,
+            K=self.K,
+            r=self.r,
+            norm_type=self.norm_type,
+            standardize=self.standardize,
+            dists_source_mean=self.dists_source_mean,
+            dists_source_std=self.dists_source_std,
+            dists_target_mean=self.dists_target_mean,
+            dists_target_std=self.dists_target_std,
         )
         log_values = {
             "amean_val_AUC": aauc,
@@ -144,6 +203,24 @@ class base_emb_model(L.LightningModule):
         return
 
     def on_test_epoch_end(self):
+        # get standardization statistics
+        (
+            self.dists_source_mean,
+            self.dists_source_std,
+            self.dists_target_mean,
+            self.dists_target_std,
+        ) = get_standardization_stats(
+            self.means,
+            self.mean_machine_ids,
+            self.mean_source_labels,
+            self.test_embs,
+            self.test_machine_ids,
+            use_mse=self.use_mse,
+            K=self.K,
+            r=self.r,
+            norm_type=self.norm_type,
+        )
+
         # compute performance
         aauc, apauc, amauc, hauc, hpauc, hmauc = get_ASD_performance(
             self.means,
@@ -153,7 +230,16 @@ class base_emb_model(L.LightningModule):
             self.test_machine_ids,
             self.test_source_labels,
             self.test_anomaly_labels,
-            print_results=True,
+            print_results=self.print_results,
+            use_mse=self.use_mse,
+            K=self.K,
+            r=self.r,
+            norm_type=self.norm_type,
+            standardize=self.standardize,
+            dists_source_mean=self.dists_source_mean,
+            dists_source_std=self.dists_source_std,
+            dists_target_mean=self.dists_target_mean,
+            dists_target_std=self.dists_target_std,
         )
 
         # free memory
@@ -176,8 +262,25 @@ class base_emb_model(L.LightningModule):
 
 
 class raw_system(base_emb_model):
-    def __init__(self, K: int = None, r: float = None):
-        super().__init__(K=K, r=r)
+    def __init__(
+        self,
+        source_K: int = None,
+        K: int = None,
+        r: float = None,
+        norm_type: str = "ratio",
+        smote: bool = False,
+        smote_num_neighbors: int = 2,
+        standardize: bool = False,
+    ):
+        super().__init__(
+            source_K=source_K,
+            K=K,
+            r=r,
+            norm_type=norm_type,
+            standardize=standardize,
+            smote=smote,
+            smote_num_neighbors=smote_num_neighbors,
+        )
         self.use_mse = True
 
     def forward(self, x):
@@ -205,10 +308,21 @@ class trainedACTsystem(base_emb_model):
         bias: bool = True,
         affine: bool = True,
         trainable_centers: bool = False,
+        source_K: int = None,
         K: int = None,
         r: float = None,
+        norm_type: str = "ratio",
+        standardize: bool = False,
+        smote: bool = False,
+        smote_num_neighbors: int = 2,
     ):
-        super().__init__(K=K, r=r)
+        super().__init__(
+            source_K=source_K,
+            K=K,
+            r=r,
+            norm_type=norm_type,
+            standardize=standardize,
+        )
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.subspace_dim = subspace_dim
@@ -268,10 +382,23 @@ class ASDsystem(base_emb_model):
         nfft: int = 1024,
         use_fft: bool = True,
         temporal_normalization: bool = True,
+        source_K: int = None,
         K: int = None,
         r: float = None,
+        norm_type: str = "ratio",
+        standardize: bool = False,
+        smote: bool = False,
+        smote_num_neighbors: int = 2,
     ):
-        super().__init__(K=K, r=r)
+        super().__init__(
+            source_K=source_K,
+            K=K,
+            r=r,
+            norm_type=norm_type,
+            standardize=standardize,
+            smote=smote,
+            smote_num_neighbors=smote_num_neighbors,
+        )
         self.input_dim = input_dim
         self.num_classes = num_classes
         self.subspace_dim = subspace_dim

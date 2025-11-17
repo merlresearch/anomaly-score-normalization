@@ -4,8 +4,11 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchmetrics
+from imblearn.over_sampling import SMOTE
 from sklearn.cluster import KMeans
+from sklearn.neighbors import LocalOutlierFactor as LOF
 
 
 def gwrp(x, r: float = 0.9, normalize: bool = False):
@@ -24,7 +27,9 @@ def get_mean_embs(
     machine_ids,
     source_labels,
     k: int = 16,
-    max_epochs: int = 300,
+    smote: bool = False,
+    smote_num_neighbors: int = 2,
+    use_mse: bool = False,
     from_lists: bool = True,
 ):
     means = []
@@ -36,8 +41,39 @@ def get_mean_embs(
         source_labels = torch.cat(source_labels, dim=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for machine_id in torch.unique(machine_ids):
-        for source in torch.unique(source_labels):
-            if source == 1:
+        if smote:
+            if (
+                len(np.unique(source_labels[machine_ids == machine_id].cpu()))
+                == 2
+            ):
+                sampler = SMOTE(k_neighbors=smote_num_neighbors)
+                machine_embs, target_labels = sampler.fit_resample(
+                    embs[machine_ids == machine_id].cpu(),
+                    source_labels[machine_ids == machine_id].cpu(),
+                )
+            else:
+                machine_embs = (
+                    embs[machine_ids == machine_id].cpu().detach().numpy()
+                )
+                target_labels = (
+                    source_labels[machine_ids == machine_id]
+                    .cpu()
+                    .detach()
+                    .numpy()
+                )
+            machine_embs = torch.from_numpy(
+                machine_embs.astype(np.float32)
+            ).to(device)
+            if not use_mse:
+                machine_embs = F.normalize(machine_embs, p=2.0, dim=1)
+            machine_source_labels = torch.from_numpy(
+                target_labels.astype(np.float32)
+            ).to(device)
+        else:
+            machine_embs = embs[machine_ids == machine_id]
+            machine_source_labels = source_labels[machine_ids == machine_id]
+        for source in torch.unique(machine_source_labels):
+            if source == 1 and k > 0:
                 kmeans = KMeans(
                     n_clusters=k,
                     random_state=0,
@@ -45,16 +81,14 @@ def get_mean_embs(
                     algorithm="elkan",
                     tol=1e-5,
                 ).fit(
-                    embs[
-                        (machine_ids == machine_id) * (source_labels == source)
-                    ].cpu()
+                    machine_embs[machine_source_labels == source].cpu()
                 )  # slower to copy to CPU but does not require extensive GPU memory (when not using 'detach()' for embs)
                 centroids = torch.from_numpy(
                     kmeans.cluster_centers_.astype(np.float32)
                 ).to(device)
             else:
-                centroids = embs[
-                    (machine_ids == machine_id) * (source_labels == source)
+                centroids = machine_embs[
+                    machine_source_labels == source
                 ]  # just use all samples of the target domain
             # centroids = F.normalize(centroids, p=2.0, dim=1)  # degrades performance, don't do this
             means.append(centroids)
@@ -71,6 +105,69 @@ def get_mean_embs(
     )
 
 
+def get_standardization_stats(
+    mean_embs,
+    mean_machine_ids,
+    mean_source_labels,
+    test_embs,
+    test_machine_ids,
+    use_mse: bool = False,
+    K: int = None,
+    r: float = None,
+    norm_type: str = "ratio",
+):
+    test_embs = torch.cat(test_embs, dim=0)
+    test_machine_ids = torch.cat(test_machine_ids, dim=0)
+    source_scores = get_scores(
+        mean_embs[mean_source_labels > 0.5],
+        mean_machine_ids[mean_source_labels > 0.5],
+        mean_source_labels[mean_source_labels > 0.5],
+        test_embs,
+        test_machine_ids,
+        use_mse=use_mse,
+        K=K,
+        r=r,
+        norm_type=norm_type,
+    )
+    target_scores = get_scores(
+        mean_embs[mean_source_labels < 0.5],
+        mean_machine_ids[mean_source_labels < 0.5],
+        mean_source_labels[mean_source_labels < 0.5],
+        test_embs,
+        test_machine_ids,
+        use_mse=use_mse,
+        K=K,
+        r=r,
+        norm_type=norm_type,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_machine_ids = torch.max(test_machine_ids).int() + 1
+    dists_source_mean = torch.zeros(num_machine_ids).to(device)
+    dists_source_std = torch.ones(num_machine_ids).to(device)
+    dists_target_mean = torch.zeros(num_machine_ids).to(device)
+    dists_target_std = torch.ones(num_machine_ids).to(device)
+    for machine_id in torch.unique(test_machine_ids):
+        if torch.sum(mean_machine_ids == machine_id) > 0:
+            dists_source_mean[machine_id.int()] = torch.mean(
+                source_scores[test_machine_ids == machine_id]
+            )
+            dists_source_std[machine_id.int()] = torch.std(
+                source_scores[test_machine_ids == machine_id]
+            )
+            dists_target_mean[machine_id.int()] = torch.mean(
+                target_scores[test_machine_ids == machine_id]
+            )
+            dists_target_std[machine_id.int()] = torch.std(
+                target_scores[test_machine_ids == machine_id]
+            )
+    return (
+        dists_source_mean,
+        dists_source_std,
+        dists_target_mean,
+        dists_target_std,
+    )
+
+
 def get_pairwise_distance(x, y, use_mse: bool = False):
     if use_mse:
         return 0.25 * torch.cdist(x, y)
@@ -81,33 +178,38 @@ def get_pairwise_distance(x, y, use_mse: bool = False):
 def get_scores(
     mean_embs,
     mean_machine_ids,
-    mean_source_labels,
+    mean_source_labels,  # required for domain-wise standardization
     test_embs,
     test_machine_ids,
-    test_source_labels=None,
-    asd_system=None,
     use_mse: bool = False,
     K: int = None,
     r: float = None,
+    norm_type: str = "ratio",
+    standardize: bool = False,
+    dists_source_mean=None,
+    dists_source_std=None,
+    dists_target_mean=None,
+    dists_target_std=None,
 ):
-    if test_source_labels is None:
-        test_source_labels = mean_source_labels
     scores = torch.ones_like(test_machine_ids) * float("Inf")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for machine_id in torch.unique(test_machine_ids):
-        for source in torch.unique(test_source_labels):
-            if (
-                torch.sum(
-                    (mean_machine_ids == machine_id)
-                    * (mean_source_labels == source)
-                )
-                > 0
-            ):
+        if torch.sum(mean_machine_ids == machine_id) > 0:
+            if norm_type == "LOF":
+                lof = LOF(n_neighbors=K, novelty=True)
+                lof.fit(mean_embs[(mean_machine_ids == machine_id)].cpu())
+                scores[test_machine_ids == machine_id] = -torch.from_numpy(
+                    lof.score_samples(
+                        test_embs[test_machine_ids == machine_id].cpu()
+                    ).astype(np.float32)
+                ).to(device)
+            else:
                 score_mod = 1
                 if K is not None or r is not None:
                     ref_scores = torch.sort(
                         get_pairwise_distance(
-                            mean_embs[(mean_machine_ids == machine_id)],
-                            mean_embs[(mean_machine_ids == machine_id)],
+                            mean_embs[mean_machine_ids == machine_id],
+                            mean_embs[mean_machine_ids == machine_id],
                             use_mse,
                         ),
                         dim=0,
@@ -120,30 +222,55 @@ def get_scores(
                         score_mod = gwrp(
                             ref_scores[1:], r=r, normalize=True
                         )  # for additive normalization, 'normalize' should be set to 'True'
-                    score_mod = score_mod[
+                dists = get_pairwise_distance(
+                    test_embs[test_machine_ids == machine_id],
+                    mean_embs[mean_machine_ids == machine_id],
+                    use_mse,
+                )
+                if norm_type == "ratio":
+                    dists = dists / score_mod
+                elif norm_type == "difference":
+                    dists = dists - score_mod
+                if standardize:
+                    dists_source = dists[
                         :,
                         (
-                            mean_source_labels[
-                                (mean_machine_ids == machine_id)
-                            ]
-                            == source
+                            mean_source_labels[mean_machine_ids == machine_id]
+                            > 0.5
                         ),
                     ]
-                scores[test_machine_ids == machine_id] = torch.minimum(
-                    scores[test_machine_ids == machine_id],
-                    torch.min(
-                        get_pairwise_distance(
-                            test_embs[test_machine_ids == machine_id],
-                            mean_embs[
-                                (mean_machine_ids == machine_id)
-                                * (mean_source_labels == source)
-                            ],
-                            use_mse,
-                        )
-                        / score_mod,
-                        dim=1,
-                    ).values,
-                )
+                    dists_target = dists[
+                        :,
+                        (
+                            mean_source_labels[mean_machine_ids == machine_id]
+                            < 0.5
+                        ),
+                    ]
+                    dists[
+                        :,
+                        (
+                            mean_source_labels[mean_machine_ids == machine_id]
+                            > 0.5
+                        ),
+                    ] = (
+                        dists_source - dists_source_mean[machine_id.int()]
+                    ) / dists_source_std[
+                        machine_id.int()
+                    ]
+                    dists[
+                        :,
+                        (
+                            mean_source_labels[mean_machine_ids == machine_id]
+                            < 0.5
+                        ),
+                    ] = (
+                        dists_target - dists_target_mean[machine_id.int()]
+                    ) / dists_target_std[
+                        machine_id.int()
+                    ]
+                scores[test_machine_ids == machine_id] = torch.min(
+                    dists, dim=1
+                ).values
     return scores
 
 
@@ -241,12 +368,13 @@ def get_ASD_performance_from_scores(
         )
         paucs.append(pauc)
         if print_results:
-            print(
-                "pAUC for machine id "
-                + str(machine_id.item())
-                + ", joint domain:"
-                + str(np.round(pauc.item() * 100, 1))
-            )
+            if torch.unique(test_source_labels).numel() > 1:
+                print(
+                    "pAUC for machine id "
+                    + str(machine_id.item())
+                    + ", joint domain: "
+                    + str(np.round(pauc.item() * 100, 1))
+                )
             print(
                 "--------------------------------------------------------------------------------"
             )
@@ -369,6 +497,12 @@ def get_ASD_performance(
     use_mse: bool = False,
     K: int = None,
     r: float = None,
+    norm_type: str = "ratio",
+    standardize: bool = False,
+    dists_source_mean=None,
+    dists_source_std=None,
+    dists_target_mean=None,
+    dists_target_std=None,
 ):
     test_embs = torch.cat(test_embs, dim=0)
     test_machine_ids = torch.cat(test_machine_ids, dim=0)
@@ -380,10 +514,15 @@ def get_ASD_performance(
         mean_source_labels,
         test_embs,
         test_machine_ids,
-        test_source_labels,
-        use_mse,
-        K,
-        r,
+        use_mse=use_mse,
+        K=K,
+        r=r,
+        norm_type=norm_type,
+        standardize=standardize,
+        dists_source_mean=dists_source_mean,
+        dists_source_std=dists_source_std,
+        dists_target_mean=dists_target_mean,
+        dists_target_std=dists_target_std,
     )
     return get_ASD_performance_from_scores(
         scores,
@@ -399,8 +538,13 @@ def harmonic_mean(x, keepdims: bool = False):
     return ((1 / x).mean(dim=0, keepdims=keepdims)) ** (-1)
 
 
-def print_mean_and_std_performance(performance_list):
-    print("source domain (AUC, pAUC, hmean):")
+def print_mean_and_std_performance(
+    performance_list, return_domain_specific=False
+):
+    if return_domain_specific:
+        print("source domain (AUC, pAUC, hmean):")
+    else:
+        print("arithmetic mean over sections (AUC, pAUC, amean):")
     print(
         [
             str(m) + " +/- " + str(n)
@@ -410,7 +554,10 @@ def print_mean_and_std_performance(performance_list):
             )
         ]
     )
-    print("target domain (AUC, pAUC, hmean):")
+    if return_domain_specific:
+        print("target domain (AUC, pAUC, hmean):")
+    else:
+        print("harmonic mean over sections (AUC, pAUC, hmean):")
     print(
         [
             str(m) + " +/- " + str(n)
@@ -420,14 +567,15 @@ def print_mean_and_std_performance(performance_list):
             )
         ]
     )
-    print("mixed domain (AUC, pAUC, hmean):")
-    print(
-        [
-            str(m) + " +/- " + str(n)
-            for m, n in zip(
-                np.round(np.mean(performance_list * 100, axis=0), 1)[6:9],
-                np.round(np.std(performance_list * 100, axis=0), 1)[6:9],
-            )
-        ]
-    )
+    if return_domain_specific:
+        print("mixed domain (AUC, pAUC, hmean):")
+        print(
+            [
+                str(m) + " +/- " + str(n)
+                for m, n in zip(
+                    np.round(np.mean(performance_list * 100, axis=0), 1)[6:9],
+                    np.round(np.std(performance_list * 100, axis=0), 1)[6:9],
+                )
+            ]
+        )
     return

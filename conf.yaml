@@ -3,13 +3,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 dataset:
-  path: ./DCASE2023_dataset/  # path to DCASE ASD dataset
-  edition: DCASE2023  # DCASE2020, DCASE2023 or DCASE2024
-  eval_metrics: simple  # official or simple
+  path: ./DCASE2025_dataset/  # path to DCASE ASD dataset
+  edition: DCASE2025  # DCASE2020, DCASE2022, DCASE2023, DCASE2024, or DCASE2025
+  eval_metrics: official  # official or simple
 
 model:
-  mode: openL3-raw  # direct-act, openL3-act, openL3-raw, BEATs-act or BEATs-raw
-  norm_param: 16  # none (default), int (for K) or float (for r)
+  mode: direct-act  # direct-act, STFT-raw, openL3-act, openL3-raw, BEATs-act, BEATs-raw, or EAT-raw
+  norm_type: ratio  # none, ratio, difference, or LOF (requires a value for K)
+  norm_param: 1  # none, int (for K), or float (for r)
+  source_K_means: none  # none (default) or int (for K)
+  standardize: false  # apply domain-wise standardization of test scores (Boolean)
+  smote: false # apply SMOTE (bool)
+  smote_num_neighbors: 4  # number of neighbors used for generating samples with SMOTE (int)
   subspace_dim: 32  # dimension of the learned AdaProj subspaces (int)
   bias: false  # use bias terms (Boolean)
   affine: false  # use (learnable) affine transformations for batch normalizations (Boolean)
@@ -18,10 +23,13 @@ model:
 training:
   n_ensemble: 10  # number of models for the ensemble/confidence intervals (int)
   batch_size: 64  # batch size for training/inference (int)
-  num_epochs_direct-act: 5  # number of epochs for direct-act (int)
+  num_epochs_direct-act: 15  # number of epochs for direct-act (int), recommendations: DCASE 2020: 10, DCASE2023: 5, DCASE2024: 15
   num_epochs_openL3-act: 500  # number of epochs for openL3-act (int)
   num_epochs_BEATs-act: 500  # number of epochs for BEATs-act (int)
+  use_checkpoints: true  # saves or loads a previously trained embedding model with the provided parameters (Boolean)
+  model_dir: ./models/  # path to model directory
 
 embs:
   openL3_input_dim: 512  # dimension of the openL3 embeddings, should match the model used (int)
   BEATs_input_dim: 6144  # dimension of the BEATs embeddings, should match the model used (int)
+  EAT_input_dim: 6912  # dimension of the EAT embeddings, should match the model used (int)

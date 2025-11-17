@@ -35,9 +35,29 @@ if __name__ == "__main__":
     dataset_path = hparams.dataset["path"]
     edition = hparams.dataset["edition"]
     mode = hparams.model["mode"]
+    source_K = str(hparams.model["source_K_means"])
+    if source_K.lower() == "none":
+        source_K = 0
+    else:
+        source_K = int(source_K)
     norm_param = str(hparams.model["norm_param"])
-    if norm_param == "None" or norm_param == "none":
+    if norm_param.lower() == "none":
         norm_param = None
+    norm_type = str(hparams.model["norm_type"])
+    if norm_type.lower() == "none":
+        norm_type = None
+    if not (
+        norm_type is None
+        or norm_type == "ratio"
+        or norm_type == "difference"
+        or norm_type == "LOF"
+    ):
+        raise TypeError(
+            'only supported normalization types are "ratio", "difference", or "LOF"!'
+        )
+    standardize = hparams.model["standardize"]
+    smote = hparams.model["smote"]
+    smote_num_neighbors = int(str(hparams.model["smote_num_neighbors"]))
 
     # check for optional normalization parameter
     K = None
@@ -46,7 +66,14 @@ if __name__ == "__main__":
         if norm_param.isdigit():
             K = int(norm_param)
         else:
-            r = float(norm_param)
+            try:
+                r = float(norm_param)
+            except ValueError:
+                raise TypeError(
+                    'The norm parameter must be either "None", int, or float!'
+                )
+    if K is None and norm_type == "LOF":
+        raise TypeError("LOF requires a value of K to be provided!")
 
     # prepare data
     if mode == "direct-act":
@@ -83,9 +110,29 @@ if __name__ == "__main__":
             max_epochs = hparams.training["num_epochs_BEATs-act"]
         else:
             max_epochs = 0  # no training for direct usage
+    elif mode == "EAT-raw":
+        target_dir = "./" + edition + "_EAT_processed"
+        prepare_dataset(
+            data_dir=dataset_path,
+            target_dir=target_dir,
+            edition=edition,
+            pre_model="EAT",
+        )
+        input_dim = hparams.embs["EAT_input_dim"]
+        max_epochs = 0  # no training for direct usage
+    elif mode == "STFT-raw":
+        target_dir = "./" + edition + "_STFT_processed"
+        prepare_dataset(
+            data_dir=dataset_path,
+            target_dir=target_dir,
+            edition=edition,
+            pre_model="STFT",
+        )
+        input_dim = int(find_max_size(data_dir=dataset_path) / 2)
+        max_epochs = 0  # no training for direct usage
     else:
         raise TypeError(
-            'only supported modes are "direct-act", "openL3-act", "openL3-raw", "BEATs-act" or "BEATs-raw"!'
+            'only supported modes are "direct-act", "STFT-raw", "openL3-act", "openL3-raw", "BEATs-act", "BEATs-raw", or "EAT-raw"!'
         )
     dcase_asd = DCASEASDDataModule(
         data_dir=target_dir,
@@ -95,18 +142,23 @@ if __name__ == "__main__":
         use_dev_for_pred=True,
         use_eval_for_pred=False,
     )
-    if mode == "openL3-raw" or mode == "BEATs-raw":
+    if (
+        mode == "openL3-raw"
+        or mode == "BEATs-raw"
+        or mode == "EAT-raw"
+        or mode == "STFT-raw"
+    ):
         dcase_asd.setup("fit")
 
     n_ensemble = hparams.training["n_ensemble"]
+    if edition == "DCASE2020":
+        n_metrics = 6
+    else:
+        n_metrics = 9
     all_scores_eval = []
-    performances_eval = np.zeros(
-        (n_ensemble, 9)
-    )  # there are 9 different metrics to be collected
+    performances_eval = np.zeros((n_ensemble, n_metrics))
     all_scores_dev = []
-    performances_dev = np.zeros(
-        (n_ensemble, 9)
-    )  # there are 9 different metrics to be collected
+    performances_dev = np.zeros((n_ensemble, n_metrics))
     for k_ensemble in np.arange(n_ensemble):
         print("Running ensemble iteration #" + str(k_ensemble + 1))
         tb_logger = L.pytorch.loggers.TensorBoardLogger(
@@ -123,8 +175,13 @@ if __name__ == "__main__":
                 bias=hparams.model["bias"],
                 affine=hparams.model["affine"],
                 trainable_centers=hparams.model["trainable_centers"],
+                source_K=source_K,
                 K=K,
                 r=r,
+                norm_type=norm_type,
+                standardize=standardize,
+                smote=smote,
+                smote_num_neighbors=smote_num_neighbors,
             )
         elif mode == "openL3-act" or mode == "BEATs-act":
             asd_system = trainedACTsystem(
@@ -134,39 +191,94 @@ if __name__ == "__main__":
                 bias=hparams.model["bias"],
                 affine=hparams.model["affine"],
                 trainable_centers=hparams.model["trainable_centers"],
+                source_K=source_K,
                 K=K,
                 r=r,
+                norm_type=norm_type,
+                standardize=standardize,
+                smote=smote,
+                smote_num_neighbors=smote_num_neighbors,
             )
-        elif mode == "openL3-raw" or mode == "BEATs-raw":
-            asd_system = raw_system(K=K, r=r)
+        elif (
+            mode == "openL3-raw"
+            or mode == "BEATs-raw"
+            or "EAT-raw"
+            or mode == "STFT-raw"
+        ):
+            asd_system = raw_system(
+                source_K=source_K,
+                K=K,
+                r=r,
+                norm_type=norm_type,
+                standardize=standardize,
+                smote=smote,
+                smote_num_neighbors=smote_num_neighbors,
+            )
         trainer = L.Trainer(
             max_epochs=max_epochs,
             num_sanity_val_steps=0,
             logger=tb_logger,
             accelerator="gpu",
             devices=1,
+            enable_checkpointing=False,
         )  # no sanity checks because means are not yet available
 
         # train model
         if mode == "direct-act" or mode == "openL3-act" or mode == "BEATs-act":
-            trainer.fit(asd_system, dcase_asd)
+            model_name = "#".join(
+                [
+                    edition,
+                    mode,
+                    str(k_ensemble),
+                    str(max_epochs),
+                    str(hparams.model["subspace_dim"]),
+                    str(hparams.model["bias"]),
+                    str(hparams.model["affine"]),
+                    str(hparams.model["trainable_centers"]),
+                    ".ckpt",
+                ]
+            )
+            model_path = Path(hparams.training["model_dir"] + model_name)
+            if model_path.is_file() and hparams.training["use_checkpoints"]:
+                if mode == "direct-act":
+                    asd_system = ASDsystem.load_from_checkpoint(
+                        checkpoint_path=model_path
+                    )
+                elif mode == "openL3-act" or mode == "BEATs-act":
+                    asd_system = trainedACTsystem.load_from_checkpoint(
+                        checkpoint_path=model_path
+                    )
+                asd_system.source_K = source_K
+                asd_system.K = K
+                asd_system.r = r
+                asd_system.norm_type = norm_type = norm_type
+                asd_system.standardize = standardize
+                asd_system.smote = smote
+                asd_system.smote_num_neighbors = smote_num_neighbors
+                dcase_asd.setup("fit")
+            else:
+                trainer.fit(asd_system, dcase_asd)
+                if hparams.training["use_checkpoints"]:
+                    trainer.save_checkpoint(model_path)
 
         # reload all data
         asd_system.eval()  # disables randomness
         # re-calculate means
         for batch_idx, batch in enumerate(dcase_asd.train_dataloader()):
             asd_system.to("cuda").reload_training_embs(batch, batch_idx)
-        if mode == "direct-act" or mode == "openL3-act" or mode == "BEATs-act":
-            (
-                asd_system.means,
-                asd_system.mean_machine_ids,
-                asd_system.mean_source_labels,
-            ) = get_mean_embs(
-                asd_system.train_embs,
-                asd_system.train_machine_ids,
-                asd_system.train_source_labels,
-                k=asd_system.subspace_dim,
-            )
+        (
+            asd_system.means,
+            asd_system.mean_machine_ids,
+            asd_system.mean_source_labels,
+        ) = get_mean_embs(
+            asd_system.train_embs,
+            asd_system.train_machine_ids,
+            asd_system.train_source_labels,
+            k=asd_system.source_K,
+            smote=asd_system.smote,
+            smote_num_neighbors=asd_system.smote_num_neighbors,
+            use_mse=asd_system.use_mse,
+        )
 
         # evaluate performance on dev data
         dcase_asd_test = DCASEASDDataModule(
@@ -177,6 +289,11 @@ if __name__ == "__main__":
             use_dev_for_train=True,
             use_dev_for_pred=True,
         )
+        if standardize:
+            asd_system.print_results = False
+            trainer.validate(
+                asd_system, dcase_asd_test, verbose=False
+            )  # used to calculate the statistics
 
         # predict with trained model and collect scores
         preds_dev = trainer.predict(asd_system, dcase_asd_test)
@@ -193,7 +310,7 @@ if __name__ == "__main__":
                 source_labels_dev,
                 anomaly_labels_dev,
                 print_results=True,
-                return_domain_specific=True,
+                return_domain_specific=edition != "DCASE2020",
                 eval_metrics=hparams.dataset["eval_metrics"],
             )
         )
@@ -207,6 +324,11 @@ if __name__ == "__main__":
             use_dev_for_train=False,
             use_dev_for_pred=False,
         )
+        if standardize:
+            asd_system.print_results = False
+            trainer.test(
+                asd_system, dcase_asd_test
+            )  # used to calculate the statistics
 
         # predict with trained model and collect scores
         preds_eval = trainer.predict(asd_system, dcase_asd_test)
@@ -226,7 +348,7 @@ if __name__ == "__main__":
                 source_labels_eval,
                 anomaly_labels_eval,
                 print_results=False,
-                return_domain_specific=True,
+                return_domain_specific=edition != "DCASE2020",
                 eval_metrics=hparams.dataset["eval_metrics"],
             )
         )
@@ -240,7 +362,9 @@ if __name__ == "__main__":
     print(
         "################################################################################"
     )
-    print_mean_and_std_performance(performances_dev)
+    print_mean_and_std_performance(
+        performances_dev, return_domain_specific=edition != "DCASE2020"
+    )
     print(
         "################################################################################"
     )
@@ -249,11 +373,12 @@ if __name__ == "__main__":
         "################################################################################"
     )
     get_ASD_performance_from_scores(
-        torch.stack(all_scores_dev).sum(dim=0),
+        torch.stack(all_scores_dev).mean(dim=0),
         machine_ids_dev,
         source_labels_dev,
         anomaly_labels_dev,
         print_results=True,
+        return_domain_specific=edition != "DCASE2020",
         eval_metrics=hparams.dataset["eval_metrics"],
     )
     print(
@@ -263,7 +388,9 @@ if __name__ == "__main__":
     print(
         "################################################################################"
     )
-    print_mean_and_std_performance(performances_eval)
+    print_mean_and_std_performance(
+        performances_eval, return_domain_specific=edition != "DCASE2020"
+    )
     print(
         "################################################################################"
     )
@@ -272,10 +399,11 @@ if __name__ == "__main__":
         "################################################################################"
     )
     get_ASD_performance_from_scores(
-        torch.stack(all_scores_eval).sum(dim=0),
+        torch.stack(all_scores_eval).mean(dim=0),
         machine_ids_eval,
         source_labels_eval,
         anomaly_labels_eval,
         print_results=True,
+        return_domain_specific=edition != "DCASE2020",
         eval_metrics=hparams.dataset["eval_metrics"],
     )

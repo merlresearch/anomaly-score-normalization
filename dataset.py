@@ -13,27 +13,33 @@ import resampy
 import soundfile as sf
 import torch
 import torch.nn.functional as F
+import torchaudio
 import torchopenl3
 from einops import rearrange
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import AutoModel
 
 from beats.BEATs import BEATs, BEATsConfig
+from network import STFT_extractor
 
 
-def adjust_size(wav, new_size: int):
-    reps = int(np.ceil(new_size / wav.shape[0]))
-    offset = np.random.randint(
-        low=0, high=int(reps * wav.shape[0] - new_size + 1)
-    )
-    new_wav = np.tile(wav, reps=reps)[
-        offset : offset + new_size
-    ]  # randomly repeat files that are too short instead of zero-padding to increase difficulty of classification task
-    return new_wav
+def adjust_size(wav, new_size: int = None):
+    if new_size is None:
+        return wav
+    else:
+        reps = int(np.ceil(new_size / wav.shape[0]))
+        offset = np.random.randint(
+            low=0, high=int(reps * wav.shape[0] - new_size + 1)
+        )
+        new_wav = np.tile(wav, reps=reps)[
+            offset : offset + new_size
+        ]  # randomly repeat files that are too short instead of zero-padding to increase difficulty of classification task
+        return new_wav
 
 
-def prep_audio(file_path: str, new_size: int, new_sr: int = None):
+def prep_audio(file_path: str, new_size: int = None, new_sr: int = None):
     wav, fs = sf.read(
         file_path, dtype="float32"
     )  # converting here saves a lot of memory
@@ -48,7 +54,12 @@ def prep_audio(file_path: str, new_size: int, new_sr: int = None):
 
 def generate_labels(file_path: str, edition: str = "DCASE2024"):
     file = os.path.split(file_path)[1]
-    if edition == "DCASE2024" or edition == "DCASE2023":
+    if (
+        edition == "DCASE2025"
+        or edition == "DCASE2024"
+        or edition == "DCASE2023"
+        or edition == "DCASE2022"
+    ):
         machine_type = os.path.split(
             os.path.split(os.path.split(file_path)[0])[0]
         )[1]
@@ -62,10 +73,14 @@ def generate_labels(file_path: str, edition: str = "DCASE2024"):
                 + "_".join(file.split(".wav")[0].split("_")[6:])
             )
         else:  # handle test data of evaluation set
-            if edition == "DCASE2024":
+            if edition == "DCASE2025":
+                gt_path = "./dcase2025_task2_evaluator"
+            elif edition == "DCASE2024":
                 gt_path = "./dcase2024_task2_evaluator"
             elif edition == "DCASE2023":
                 gt_path = "./dcase2023_task2_evaluator"
+            elif edition == "DCASE2022":
+                gt_path = "./dcase2022_evaluator"
             gt_anomaly = dict(
                 pd.read_csv(
                     os.path.join(
@@ -83,22 +98,51 @@ def generate_labels(file_path: str, edition: str = "DCASE2024"):
                 ).to_numpy()
             )
             anomaly_label = gt_anomaly[file]
-            gt_attribute = dict(
-                pd.read_csv(
+            if edition == "DCASE2022":
+                gt_attribute = pd.read_csv(
                     os.path.join(
                         gt_path,
                         "ground_truth_attributes",
-                        "ground_truth_"
-                        + machine_type
-                        + "_"
-                        + file.split("_")[0]
-                        + "_"
-                        + file.split("_")[1]
-                        + "_test.csv",
+                        machine_type,
+                        "attributes_" + file.split("_")[1] + ".csv",
                     ),
-                    header=None,
                 ).to_numpy()
-            )
+                # fix missing values
+                for k in np.arange(gt_attribute.shape[0]):
+                    if not isinstance(gt_attribute[k, -1], str):
+                        j = 1
+                        while str(gt_attribute[k, -j]) == "nan":
+                            j = j + 1
+                        gt_attribute[k, -1] = gt_attribute[k, -j]
+                gt_attribute_keys = gt_attribute[:, 0]
+                gt_attribute_values = gt_attribute[:, -1]
+                for k in np.arange(gt_attribute.shape[0]):
+                    gt_attribute_keys[k] = gt_attribute_keys[k].split("/")[-1]
+                    gt_attribute_values[k] = (
+                        gt_attribute_values[k].split("/")[-1].split(".wav")[0]
+                    )
+                gt_attribute = dict(
+                    np.vstack(
+                        (gt_attribute_keys, gt_attribute_values)
+                    ).transpose()
+                )
+            else:
+                gt_attribute = dict(
+                    pd.read_csv(
+                        os.path.join(
+                            gt_path,
+                            "ground_truth_attributes",
+                            "ground_truth_"
+                            + machine_type
+                            + "_"
+                            + file.split("_")[0]
+                            + "_"
+                            + file.split("_")[1]
+                            + "_test.csv",
+                        ),
+                        header=None,
+                    ).to_numpy()[:, :2]
+                )
             source_label = int(gt_attribute[file].split("_")[2] == "source")
             attribute_label = (
                 machine_type
@@ -161,6 +205,7 @@ def get_data_from_dir(
     new_sr: int = None,
     pre_model: str = None,
 ):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     collected_wav = []
     collected_anomaly_label = []
     collected_machine_id_label = []
@@ -176,7 +221,21 @@ def get_data_from_dir(
         cfg = BEATsConfig(checkpoint["cfg"])
         BEATs_model = BEATs(cfg)
         BEATs_model.load_state_dict(checkpoint["model"])
-        BEATs_model.eval()
+        BEATs_model.eval().cuda()
+    elif pre_model == "EAT":
+        model_id = "worstchan/EAT-large_epoch20_pretrain"
+        EAT_model = (
+            AutoModel.from_pretrained(model_id, trust_remote_code=True)
+            .eval()
+            .cuda()
+        )
+        new_size = None
+    elif pre_model == "STFT":
+        stft = STFT_extractor(
+            affine=False,
+            nfft=1024,
+            temporal_normalization=False,
+        ).to(device)
     for category in os.listdir(os.path.join(data_dir, dataset)):
         for file_name in tqdm(
             os.listdir(os.path.join(data_dir, dataset, category, data_split))
@@ -207,8 +266,10 @@ def get_data_from_dir(
                         )  # mean pooling over temporal dimension
                 elif pre_model == "BEATs":
                     with torch.no_grad():
-                        wav = torch.from_numpy(np.expand_dims(wav, axis=0))
-                        padding_mask = torch.zeros_like(wav).bool()
+                        wav = torch.from_numpy(np.expand_dims(wav, axis=0)).to(
+                            device
+                        )
+                        padding_mask = torch.zeros_like(wav).bool().to(device)
                         wav = BEATs_model.extract_features(
                             wav, padding_mask=padding_mask, need_weights=True
                         )[0]
@@ -216,11 +277,78 @@ def get_data_from_dir(
                             rearrange(
                                 wav[0].detach().cpu().numpy(),
                                 "(t f) d -> t f d",
-                                f=8,
+                                f=8,  # equals 128/16
                             )
                             .mean(axis=0)
                             .reshape(-1)
                         )  # mean pooling over temporal dimension + flattening
+                elif pre_model == "EAT":
+                    with torch.no_grad():
+                        waveform = torch.from_numpy(wav)
+                        norm_mean = -4.268
+                        norm_std = 4.569
+                        # Normalize and convert to mel-spectrogram
+                        waveform = waveform - waveform.mean()
+                        mel = torchaudio.compliance.kaldi.fbank(
+                            waveform.unsqueeze(0),
+                            htk_compat=True,
+                            sample_frequency=16000,
+                            use_energy=False,
+                            window_type="hanning",
+                            num_mel_bins=128,
+                            dither=0.0,
+                            frame_shift=10,
+                        ).unsqueeze(0)
+
+                        # Pad or truncate
+                        n_frames = mel.shape[1]
+                        target_length = (
+                            (n_frames + 15) // 16
+                        ) * 16  # Round up to nearest multiple of 16
+                        if n_frames < target_length:
+                            mel = torch.nn.ZeroPad2d(
+                                (0, 0, 0, target_length - n_frames)
+                            )(mel)
+                        else:
+                            reps = int(np.ceil(target_length / n_frames))
+                            offset = np.random.randint(
+                                low=0,
+                                high=int(reps * n_frames - target_length + 1),
+                            )
+                            mel = mel[:, offset : offset + target_length, :]
+
+                        # Normalize
+                        mel = (mel - norm_mean) / (norm_std * 2)
+                        mel = mel.unsqueeze(0).to(
+                            device
+                        )  # shape: [1, 1, T, F]
+
+                        # Extract features
+                        with torch.no_grad():
+                            wav = EAT_model.extract_features(mel)
+                        wav_seq = (
+                            rearrange(
+                                wav[0, 1:].detach().cpu().numpy(),
+                                "(t f) d -> t f d",
+                                f=8,  # equals 128/16
+                            )
+                            .mean(axis=0)
+                            .reshape(1, -1)
+                        )
+                        wav = np.concatenate(
+                            (wav[:, 0].detach().cpu().numpy(), wav_seq), axis=1
+                        )[
+                            0
+                        ]  # concatenate CLS token and temporal mean of patch embeddings
+                elif pre_model == "STFT":
+                    wav = torch.from_numpy(np.expand_dims(wav, axis=0)).to(
+                        device
+                    )
+                    with torch.no_grad():
+                        wav = torch.abs(stft(wav))
+                    wav = (
+                        torch.mean(wav, dim=1).cpu().numpy()[0, :]
+                    )  # mean pooling over temporal dimension
                 collected_wav.append(wav)
                 collected_anomaly_label.append(anomaly_label)
                 collected_machine_id_label.append(machine_id_label)
